@@ -14,6 +14,7 @@ interface ScreenData {
   imageUrl?: string;
   isGenerating?: boolean;
   progress?: number;
+  errorMsg?: string;
 }
 
 // 淘宝/得物级动态电商海报排版引擎
@@ -238,90 +239,122 @@ export default function App() {
     }
   };
 
-  const generateImage = async (index: number, screen: ScreenData) => {
+  const generateImage = async (index: number, screen: ScreenData, retryCount: number = 0): Promise<void> => {
     if (!apiKey) {
       alert('请先填写 API Key');
       return;
     }
 
-    setScreens(prev => prev.map((s, i) => i === index ? { ...s, isGenerating: true, progress: 0 } : s));
+    setScreens(prev => prev.map((s, i) => i === index ? { ...s, isGenerating: true, progress: 0, errorMsg: undefined } : s));
 
-    try {
-      const drawRes = await fetch('https://grsai.dakka.com.cn/v1/draw/nano-banana', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${apiKey}`
-        },
-        body: JSON.stringify({
-          model: drawModel,
-          prompt: screen.prompt.replace(/\n/g, ', ').replace(/\s+/g, ' '),
-          aspectRatio: aspectRatio,
-          imageSize: imageSize,
-          urls: [imageBase64],
-          webHook: '-1',
-          shutProgress: false
-        })
-      });
+    return new Promise(async (resolve) => {
+      try {
+        const drawRes = await fetch('https://grsai.dakka.com.cn/v1/draw/nano-banana', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${apiKey}`
+          },
+          body: JSON.stringify({
+            model: drawModel,
+            prompt: screen.prompt.replace(/\n/g, ', ').replace(/\s+/g, ' '),
+            aspectRatio: aspectRatio,
+            imageSize: imageSize,
+            urls: [imageBase64],
+            webHook: '-1',
+            shutProgress: false
+          })
+        });
 
-      if (!drawRes.ok) throw new Error('绘画请求失败');
-      
-      const drawData = await drawRes.json();
-      if (drawData.code !== 0 || !drawData.data?.id) throw new Error('未获取到任务ID');
+        if (!drawRes.ok) throw new Error('绘画请求失败');
+        
+        const drawData = await drawRes.json();
+        if (drawData.code !== 0 || !drawData.data?.id) throw new Error('未获取到任务ID');
 
-      const taskId = drawData.data.id;
+        const taskId = drawData.data.id;
 
-      const poll = async () => {
-        try {
-          const resultRes = await fetch('https://grsai.dakka.com.cn/v1/draw/result', {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              'Authorization': `Bearer ${apiKey}`
-            },
-            body: JSON.stringify({ id: taskId })
-          });
-          
-          const resultData = await resultRes.json();
-          
-          if (resultData.code === 0 && resultData.data) {
-            const { status, progress, results, failure_reason, error } = resultData.data;
-            if (status === 'succeeded' && results && results.length > 0) {
-              setScreens(prev => prev.map((s, i) => i === index ? { 
-                ...s, isGenerating: false, imageUrl: results[0].url, progress: 100 
-              } : s));
-            } else if (status === 'failed') {
-              throw new Error(`生成失败: ${failure_reason || error || '未知错误'}`);
+        const poll = async () => {
+          try {
+            const resultRes = await fetch('https://grsai.dakka.com.cn/v1/draw/result', {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${apiKey}`
+              },
+              body: JSON.stringify({ id: taskId })
+            });
+            
+            const resultData = await resultRes.json();
+            
+            if (resultData.code === 0 && resultData.data) {
+              const { status, progress, results, failure_reason, error } = resultData.data;
+              if (status === 'succeeded' && results && results.length > 0) {
+                setScreens(prev => prev.map((s, i) => i === index ? { 
+                  ...s, isGenerating: false, imageUrl: results[0].url, progress: 100 
+                } : s));
+                resolve(); // 成功完成
+              } else if (status === 'failed') {
+                throw new Error(`生成失败: ${failure_reason || error || '未知错误'}`);
+              } else {
+                setScreens(prev => prev.map((s, i) => i === index ? { ...s, progress: progress || 0 } : s));
+                setTimeout(poll, 2500); // 增加一点轮询间隔减轻压力
+              }
+            } else if (resultData.code === -22) {
+               throw new Error('任务不存在');
             } else {
-              setScreens(prev => prev.map((s, i) => i === index ? { ...s, progress: progress || 0 } : s));
-              setTimeout(poll, 2000);
+               setTimeout(poll, 2500);
             }
-          } else if (resultData.code === -22) {
-             throw new Error('任务不存在');
-          } else {
-             setTimeout(poll, 2000);
+          } catch (pollErr: any) {
+            console.error(pollErr);
+            if (retryCount < 2) {
+              console.log(`Retrying generation for screen ${screen.id}, attempt ${retryCount + 1}`);
+              setTimeout(() => {
+                generateImage(index, screen, retryCount + 1).then(resolve);
+              }, 2000);
+              return;
+            }
+            // 失败时也 resolve，以免阻塞队列
+            setScreens(prev => prev.map((s, i) => i === index ? { ...s, isGenerating: false, errorMsg: pollErr.message } : s));
+            resolve();
           }
-        } catch (pollErr: any) {
-          alert(`生成第 ${screen.id} 屏图片失败: ` + pollErr.message);
-          setScreens(prev => prev.map((s, i) => i === index ? { ...s, isGenerating: false } : s));
+        };
+
+        poll();
+
+      } catch (err: any) {
+        console.error(err);
+        if (retryCount < 2) {
+          console.log(`Retrying generation for screen ${screen.id}, attempt ${retryCount + 1}`);
+          setTimeout(() => {
+            generateImage(index, screen, retryCount + 1).then(resolve);
+          }, 2000);
+          return;
         }
-      };
-
-      poll();
-
-    } catch (err: any) {
-      alert(`生成第 ${screen.id} 屏图片失败: ` + err.message);
-      setScreens(prev => prev.map((s, i) => i === index ? { ...s, isGenerating: false } : s));
-    }
-  };
-
-  // 生成所有未生成的图片
-  const generateAllImages = () => {
-    screens.forEach((screen, index) => {
-      if (!screen.imageUrl && !screen.isGenerating) {
-        generateImage(index, screen);
+        setScreens(prev => prev.map((s, i) => i === index ? { ...s, isGenerating: false, errorMsg: err.message } : s));
+        resolve(); // 失败时也 resolve
       }
     });
+  };
+
+  const [isGeneratingAll, setIsGeneratingAll] = useState(false);
+
+  // 顺序队列：生成所有未生成的图片 (防止并发报错)
+  const generateAllImages = async () => {
+    if (isGeneratingAll) return;
+    setIsGeneratingAll(true);
+    
+    // 获取当前所有需要生成的屏
+    const queue = screens.map((screen, index) => ({ screen, index }))
+                         .filter(item => !item.screen.imageUrl && !item.screen.isGenerating);
+                         
+    for (const item of queue) {
+      // 串行执行，等待上一张生成完毕再请求下一张
+      await generateImage(item.index, item.screen);
+      // 额外加 1.5 秒的安全缓冲时间，防止 API 接口频率限制 (429 Too Many Requests)
+      await new Promise(r => setTimeout(r, 1500));
+    }
+    
+    setIsGeneratingAll(false);
   };
 
   return (
@@ -487,10 +520,18 @@ export default function App() {
               <div className="flex gap-3 mt-4 sm:mt-0">
                 <button
                   onClick={generateAllImages}
-                  className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-bold rounded-md shadow-sm transition-colors flex items-center"
+                  disabled={isGeneratingAll}
+                  className={`px-4 py-2 text-white text-sm font-bold rounded-md shadow-sm transition-colors flex items-center ${isGeneratingAll ? 'bg-indigo-400 cursor-not-allowed' : 'bg-indigo-600 hover:bg-indigo-700'}`}
                 >
-                  <svg className="w-4 h-4 mr-1.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19.428 15.428a2 2 0 00-1.022-.547l-2.387-.477a6 6 0 00-3.86.517l-.318.158a6 6 0 01-3.86.517L6.05 15.21a2 2 0 00-1.806.547M8 4h8l-1 1v5.172a2 2 0 00.586 1.414l5 5c1.26 1.26.367 3.414-1.415 3.414H4.828c-1.782 0-2.674-2.154-1.414-3.414l5-5A2 2 0 009 10.172V5L8 4z" /></svg>
-                  一键全部生成
+                  {isGeneratingAll ? (
+                    <svg className="animate-spin -ml-1 mr-2 h-4 w-4 text-white" fill="none" viewBox="0 0 24 24">
+                      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                    </svg>
+                  ) : (
+                    <svg className="w-4 h-4 mr-1.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19.428 15.428a2 2 0 00-1.022-.547l-2.387-.477a6 6 0 00-3.86.517l-.318.158a6 6 0 01-3.86.517L6.05 15.21a2 2 0 00-1.806.547M8 4h8l-1 1v5.172a2 2 0 00.586 1.414l5 5c1.26 1.26.367 3.414-1.415 3.414H4.828c-1.782 0-2.674-2.154-1.414-3.414l5-5A2 2 0 009 10.172V5L8 4z" /></svg>
+                  )}
+                  {isGeneratingAll ? '排队生成中...' : '一键全部生成'}
                 </button>
                 <button
                   onClick={() => setShowMobilePreview(true)}
@@ -539,6 +580,14 @@ export default function App() {
                             <div className="bg-gradient-to-r from-blue-600 to-cyan-400 h-1.5 rounded-full transition-all duration-300 shadow-[0_0_10px_rgba(34,211,238,0.5)]" style={{ width: `${screen.progress}%` }}></div>
                           </div>
                           <span className="text-cyan-400 font-mono text-xs mt-2">{screen.progress}%</span>
+                        </div>
+                      ) : screen.errorMsg ? (
+                        <div className="flex flex-col items-center justify-center text-red-500 w-full px-6 z-10 text-center bg-red-50/5">
+                          <svg className="w-12 h-12 mb-3 text-red-500 opacity-80" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                          </svg>
+                          <span className="font-bold text-sm tracking-widest uppercase mb-1 drop-shadow-md text-red-400">Task Failed</span>
+                          <span className="text-red-400/80 text-[10px] mt-1 border border-red-500/30 px-2 py-1 rounded bg-red-500/10 backdrop-blur-sm max-w-[80%] break-all">{screen.errorMsg}</span>
                         </div>
                       ) : (
                         <div className="text-gray-500 flex flex-col items-center text-center px-4 z-10">
@@ -599,10 +648,12 @@ export default function App() {
                       <button
                         onClick={() => generateImage(index, screen)}
                         disabled={screen.isGenerating}
-                        className={`w-full py-3.5 rounded-lg font-bold tracking-widest text-sm flex justify-center items-center transition-all ${screen.isGenerating ? 'bg-gray-100 text-gray-400 cursor-not-allowed border border-gray-200' : screen.imageUrl ? 'bg-white text-black border-2 border-black hover:bg-black hover:text-white shadow-[4px_4px_0_0_rgba(0,0,0,1)] hover:shadow-none hover:translate-x-1 hover:translate-y-1' : 'bg-black text-white border-2 border-black hover:bg-gray-800 shadow-[4px_4px_0_0_rgba(0,0,0,0.2)] hover:shadow-none hover:translate-x-1 hover:translate-y-1'}`}
+                        className={`w-full py-3.5 rounded-lg font-bold tracking-widest text-sm flex justify-center items-center transition-all ${screen.isGenerating ? 'bg-gray-100 text-gray-400 cursor-not-allowed border border-gray-200' : screen.errorMsg ? 'bg-red-50 text-red-600 border-2 border-red-500 hover:bg-red-500 hover:text-white shadow-[4px_4px_0_0_rgba(239,68,68,1)] hover:shadow-none hover:translate-x-1 hover:translate-y-1' : screen.imageUrl ? 'bg-white text-black border-2 border-black hover:bg-black hover:text-white shadow-[4px_4px_0_0_rgba(0,0,0,1)] hover:shadow-none hover:translate-x-1 hover:translate-y-1' : 'bg-black text-white border-2 border-black hover:bg-gray-800 shadow-[4px_4px_0_0_rgba(0,0,0,0.2)] hover:shadow-none hover:translate-x-1 hover:translate-y-1'}`}
                       >
                         {screen.isGenerating ? (
                           'GENERATING...'
+                        ) : screen.errorMsg ? (
+                          '失败，点击重试'
                         ) : screen.imageUrl ? (
                           '重新渲染此大片'
                         ) : (
